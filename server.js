@@ -2,6 +2,8 @@
 // Nie liczy żadnej fizyki: tworzy pokoje (kod 4 litery), pilnuje miejsc 0-3
 // i przekazuje wiadomości między graczami w tym samym pokoju.
 // Szybka gra: publiczne pokoje, do których losowi gracze trafiają automatycznie.
+// Tryby publicznych pokoi: "single" (jeden wyścig), "match" (mecz 15 biegów),
+// "tournament" (turniej indywidualny 20 biegów). Każdy tryb ma osobną kolejkę.
 const http = require("http");
 const { WebSocketServer } = require("ws");
 
@@ -13,7 +15,19 @@ const MAX_MSGS_PER_SEC = 80;      // limit wiadomości od jednego klienta
 const ROOM_IDLE_MS = 30 * 60e3;   // pusty/nieaktywny pokój znika po 30 min
 const QUICK_COUNTDOWN_SEC = 15;   // szybka gra: tyle sekund od zebrania 2 graczy do startu
 
-const rooms = new Map(); // kod -> { code, slots: [ws|null x4], host: 0, racing: false, public: false, timer: null, last: ms }
+// Ile biegów ma seria (musi się zgadzać z MATCH_RACES i TOURNAMENT_RACES w grze)
+const SERIES_RACES = { match: 15, tournament: 20 };
+const MODES = ["single", "match", "tournament"];
+
+// Pola startowe w kolejnych biegach serii: [czerwony, niebieski, biały, żółty] (jak MATCH_GRID w grze)
+const MATCH_GRID = [
+  [0, 2, 1, 3],
+  [1, 3, 0, 2],
+  [2, 0, 3, 1],
+  [3, 1, 2, 0],
+];
+
+const rooms = new Map(); // kod -> { code, slots: [ws|null x4], host: 0, racing: false, public: false, mode, raceNo, timer: null, last: ms }
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
@@ -66,13 +80,15 @@ function sendPlayers(room) {
   broadcast(room, { t: "players", players: playersOf(room), host: room.host });
 }
 
-function makeRoom(code, isPublic) {
+function makeRoom(code, isPublic, mode) {
   const room = {
     code,
     slots: [null, null, null, null],
     host: 0,
     racing: false,
     public: isPublic,
+    mode: mode || "single",
+    raceNo: 0,
     timer: null,
     countdownEnd: 0,
     last: Date.now(),
@@ -87,17 +103,44 @@ function destroyRoom(room) {
 }
 
 // ---------- start wyścigu (ręczny przez hosta albo automatyczny w szybkiej grze) ----------
-function startRace(room) {
-  if (room.racing) return;
-  stopCountdown(room, false);
-  room.racing = true;
+// Pola startowe: w serii z tabeli MATCH_GRID, w pojedynczym wyścigu losowo
+function lanesFor(room) {
+  if (room.mode !== "single") {
+    const index = (room.raceNo % 2) + 2 * (Math.floor(room.raceNo / 2) % 2);
+    return MATCH_GRID[index].slice();
+  }
   const lanes = [0, 1, 2, 3];
   for (let i = lanes.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [lanes[i], lanes[j]] = [lanes[j], lanes[i]];
   }
+  return lanes;
+}
+
+function sendGo(room) {
   const delay = 0.5 + Math.random() * 4.5; // jak w grze: 0.5 - 5.0 s do zielonego
-  broadcast(room, { t: "go", lanes, delay, players: playersOf(room) });
+  broadcast(room, {
+    t: "go",
+    lanes: lanesFor(room),
+    delay,
+    players: playersOf(room),
+    mode: room.mode,
+    race: room.raceNo,
+  });
+}
+
+function startRace(room) {
+  if (room.racing) return;
+  stopCountdown(room, false);
+  room.racing = true;   // w serii zostaje true aż do końca, więc nikt nowy nie wskoczy w trakcie
+  room.raceNo = 0;
+  sendGo(room);
+}
+
+// Kolejny bieg serii (mecz / turniej)
+function nextRace(room) {
+  room.raceNo += 1;
+  sendGo(room);
 }
 
 // ---------- odliczanie w szybkiej grze ----------
@@ -156,12 +199,12 @@ function leave(ws) {
   updateCountdown(room);
 }
 
-// Szuka publicznego pokoju w poczekalni z wolnym miejscem (najpierw najbardziej zapełnionego)
-function findQuickRoom() {
+// Szuka publicznego pokoju danego trybu w poczekalni z wolnym miejscem (najpierw najbardziej zapełnionego)
+function findQuickRoom(mode) {
   let best = null;
   let bestCount = -1;
   for (const room of rooms.values()) {
-    if (!room.public || room.racing) continue;
+    if (!room.public || room.racing || room.mode !== mode) continue;
     const count = playersOf(room).length;
     if (count >= MAX_PLAYERS) continue;
     if (count > bestCount) { best = room; bestCount = count; }
@@ -193,21 +236,22 @@ wss.on("connection", (ws) => {
       const code = newCode();
       if (!code) return send(ws, { t: "error", msg: "BRAK MIEJSCA NA SERWERZE" });
       ws.pname = cleanName(m.name);
-      const room = makeRoom(code, false);
+      const room = makeRoom(code, false, "single");
       room.slots[0] = ws;
       ws.room = room;
-      send(ws, { t: "joined", code, slot: 0, host: 0, public: false, players: playersOf(room) });
+      send(ws, { t: "joined", code, slot: 0, host: 0, public: false, mode: "single", players: playersOf(room) });
       return;
     }
 
     if (m.t === "quick") {
-      // Szybka gra: dołącz do publicznego pokoju albo załóż nowy (pierwszy gracz = host)
+      // Szybka gra / mecz / turniej: dołącz do publicznego pokoju tego trybu albo załóż nowy (pierwszy gracz = host)
       if (ws.room) return;
-      let room = findQuickRoom();
+      const mode = MODES.includes(m.mode) ? m.mode : "single";
+      let room = findQuickRoom(mode);
       if (!room) {
         const code = newCode();
         if (!code) return send(ws, { t: "error", msg: "BRAK MIEJSCA NA SERWERZE" });
-        room = makeRoom(code, true);
+        room = makeRoom(code, true, mode);
       }
       const slot = room.slots.indexOf(null);
       if (slot < 0) return send(ws, { t: "error", msg: "BRAK WOLNYCH MIEJSC" });
@@ -215,7 +259,7 @@ wss.on("connection", (ws) => {
       room.slots[slot] = ws;
       ws.room = room;
       room.last = now;
-      send(ws, { t: "joined", code: room.code, slot, host: room.host, public: true, players: playersOf(room) });
+      send(ws, { t: "joined", code: room.code, slot, host: room.host, public: true, mode: room.mode, players: playersOf(room) });
       sendPlayers(room);
       updateCountdown(room);
       return;
@@ -233,7 +277,7 @@ wss.on("connection", (ws) => {
       room.slots[slot] = ws;
       ws.room = room;
       room.last = now;
-      send(ws, { t: "joined", code, slot, host: room.host, public: room.public, players: playersOf(room) });
+      send(ws, { t: "joined", code, slot, host: room.host, public: room.public, mode: room.mode, players: playersOf(room) });
       sendPlayers(room);
       updateCountdown(room);
       return;
@@ -252,10 +296,22 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (m.t === "next") {
+      // Host rusza następny bieg serii. Numer biegu chroni przed podwójnym wysłaniem.
+      if (slot !== room.host || !room.racing) return;
+      const total = SERIES_RACES[room.mode];
+      if (!total) return;
+      const wanted = Number(m.race);
+      if (wanted !== room.raceNo + 1 || wanted >= total) return;
+      nextRace(room);
+      return;
+    }
+
     if (m.t === "back") {
-      // Host wraca do poczekalni po wyścigu; reszta dostaje to samo
+      // Host wraca do poczekalni po wyścigu (albo po całej serii); reszta dostaje to samo
       if (slot !== room.host) return;
       room.racing = false;
+      room.raceNo = 0;
       broadcast(room, { t: "lobby" }, ws);
       updateCountdown(room); // szybka gra: odliczanie do kolejnego wyścigu
       return;
