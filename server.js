@@ -27,7 +27,7 @@ const MATCH_GRID = [
   [3, 1, 2, 0],
 ];
 
-const rooms = new Map(); // kod -> { code, slots: [ws|null x4], host: 0, racing: false, public: false, mode, raceNo, timer: null, last: ms }
+const rooms = new Map(); // kod -> { code, slots: [ws|null x4], host: 0, racing: false, public: false, mode, raceNo, goId, timer: null, last: ms }
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
@@ -89,6 +89,7 @@ function makeRoom(code, isPublic, mode) {
     public: isPublic,
     mode: mode || "single",
     raceNo: 0,
+    goId: 0,
     timer: null,
     countdownEnd: 0,
     last: Date.now(),
@@ -119,8 +120,10 @@ function lanesFor(room) {
 
 function sendGo(room) {
   const delay = 0.5 + Math.random() * 4.5; // jak w grze: 0.5 - 5.0 s do zielonego
+  room.goId += 1; // unikalny numer startu: gra odrzuca wiadomości z poprzedniego biegu
   broadcast(room, {
     t: "go",
+    id: room.goId,
     lanes: lanesFor(room),
     delay,
     players: playersOf(room),
@@ -188,7 +191,7 @@ function leave(ws) {
   if (slot < 0) return;
   room.slots[slot] = null;
   if (slot === room.host) {
-    // Host (to on liczy boty) wyszedł: zamykamy pokój dla wszystkich
+    // Host (to on liczy boty i wyniki) wyszedł: zamykamy pokój dla wszystkich
     broadcast(room, { t: "closed", msg: "HOST WYSZEDŁ" });
     for (const w of room.slots) if (w) w.room = null;
     destroyRoom(room);
@@ -318,7 +321,7 @@ wss.on("connection", (ws) => {
     }
 
     if (m.t === "s") {
-      // Stan zawodnika. Gość może wysłać tylko własny slot, host także boty.
+      // Stan zawodnika (z numerem startu "r"). Gość może wysłać tylko własny slot, host także boty.
       const s = Number(m.s);
       if (!Number.isInteger(s) || s < 0 || s >= MAX_PLAYERS) return;
       if (s !== slot && slot !== room.host) return;
@@ -331,7 +334,14 @@ wss.on("connection", (ws) => {
       const s = Number(m.s);
       if (!Number.isInteger(s) || s < 0 || s >= MAX_PLAYERS) return;
       if (s !== slot && slot !== room.host) return;
-      broadcast(room, { t: "out", s }, ws);
+      broadcast(room, { t: "out", s, r: m.r }, ws);
+      return;
+    }
+
+    if (m.t === "res") {
+      // Oficjalne wyniki biegu: wysyła tylko host, reszta je przyjmuje
+      if (slot !== room.host) return;
+      broadcast(room, { t: "res", r: m.r, order: m.order, times: m.times, out: m.out }, ws);
       return;
     }
 
